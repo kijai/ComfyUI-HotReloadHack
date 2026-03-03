@@ -11,6 +11,7 @@ import requests
 import threading
 import importlib
 import asyncio
+import inspect
 from collections import defaultdict
 
 from watchdog.observers import Observer
@@ -138,6 +139,7 @@ class DebouncedHotReloader(FileSystemEventHandler):
         self.__last_modified: defaultdict[str, float] = defaultdict(float)
         self.__reload_timers: dict[str, threading.Timer] = {}
         self.__hashes: dict[str, str] = {}
+        self.__mtimes: dict[str, float] = {}
         self.__lock: threading.Lock = threading.Lock()
 
     async def __reload(self, module_name: str) -> web.Response:
@@ -168,8 +170,24 @@ class DebouncedHotReloader(FileSystemEventHandler):
             try:
                 sys.modules[module_name] = module
                 spec.loader.exec_module(module)
-                for key in module.NODE_CLASS_MAPPINGS.keys():
-                    RELOADED_CLASS_TYPES[key] = 3
+                # V1 node definition
+                if hasattr(module, 'NODE_CLASS_MAPPINGS') and module.NODE_CLASS_MAPPINGS is not None:
+                    for key in module.NODE_CLASS_MAPPINGS.keys():
+                        RELOADED_CLASS_TYPES[key] = 3
+                # V3 Extension Definition
+                elif hasattr(module, 'comfy_entrypoint'):
+                    entrypoint = getattr(module, 'comfy_entrypoint')
+                    if callable(entrypoint):
+                        if inspect.iscoroutinefunction(entrypoint):
+                            extension = await entrypoint()
+                        else:
+                            extension = entrypoint()
+                        node_list = await extension.get_node_list()
+                        for node_cls in node_list:
+                            schema = node_cls.GET_SCHEMA()
+                            RELOADED_CLASS_TYPES[schema.node_id] = 3
+                else:
+                    logging.warning(f"Module {module_name} has neither NODE_CLASS_MAPPINGS nor comfy_entrypoint; cache invalidation skipped.")
             except Exception as e:
                 logging.error(f"Failed to reload module {module_name}: {e}")
                 return web.Response(text='FAILED')
@@ -184,6 +202,11 @@ class DebouncedHotReloader(FileSystemEventHandler):
             return
 
         file_path: str = event.src_path
+
+        # Filter out temporary files created by editors (VS Code, etc.)
+        file_name: str = os.path.basename(file_path)
+        if file_name.startswith('.') or file_name.endswith(('.tmp', '.swp', '~')) or file_name.startswith('~'):
+            return
 
         if not any(ext == '*' for ext in HOTRELOAD_EXTENSIONS):
             if not any(file_path.endswith(ext) for ext in HOTRELOAD_EXTENSIONS):
@@ -200,11 +223,29 @@ class DebouncedHotReloader(FileSystemEventHandler):
         elif root_dir in EXCLUDE_MODULES:
             return
 
+        # Quick mtime check to filter out metadata-only changes (common on Windows)
+        try:
+            current_mtime: float = os.path.getmtime(file_path)
+        except OSError:
+            # File might not exist anymore
+            return
+
+        if current_mtime == self.__mtimes.get(file_path):
+            # mtime unchanged, skip hashing
+            return
+
         current_hash: str = hash_file(file_path)
+        if current_hash is None:
+            # File might not exist anymore (intermediate state during save)
+            return
+
         if current_hash == self.__hashes.get(file_path):
+            # Content hasn't changed, just update mtime cache
+            self.__mtimes[file_path] = current_mtime
             logging.debug(f"File {file_path} triggered event but content hasn't changed. Ignoring.")
             return
 
+        self.__mtimes[file_path] = current_mtime
         self.__hashes[file_path] = current_hash
         self.schedule_reload(root_dir)
 

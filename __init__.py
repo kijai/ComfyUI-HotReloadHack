@@ -163,7 +163,13 @@ class DebouncedHotReloader(FileSystemEventHandler):
             if module_name in sys.modules:
                 del sys.modules[module_name]
 
-            module_path_init: str = os.path.join(CUSTOM_NODE_ROOT[0], module_name, '__init__.py')
+            module_dir: str = os.path.join(CUSTOM_NODE_ROOT[0], module_name)
+            if os.path.isfile(module_dir):
+                # Single-file custom node (e.g. trainlatent2rgb.py)
+                module_path_init = module_dir
+            else:
+                # Package-style custom node with __init__.py
+                module_path_init = os.path.join(module_dir, '__init__.py')
             spec = importlib.util.spec_from_file_location(module_name, module_path_init)
             module = importlib.util.module_from_spec(spec)
 
@@ -278,8 +284,11 @@ class DebouncedHotReloader(FileSystemEventHandler):
                 return
 
         try:
-            asyncio.run(self.__reload(module_name))
-            logging.info(f'[ComfyUI-HotReloadHack] Reloaded module {module_name}')
+            response = asyncio.run(self.__reload(module_name))
+            if response.text == 'OK':
+                logging.info(f'[ComfyUI-HotReloadHack] Reloaded module {module_name}')
+            else:
+                logging.warning(f'[ComfyUI-HotReloadHack] Failed to reload module {module_name}')
         except requests.RequestException as e:
             logging.error(f"Error calling reload for module {module_name}: {e}")
         except Exception as e:

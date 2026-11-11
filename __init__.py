@@ -141,6 +141,7 @@ class DebouncedHotReloader(FileSystemEventHandler):
         self.__hashes: dict[str, str] = {}
         self.__mtimes: dict[str, float] = {}
         self.__lock: threading.Lock = threading.Lock()
+        self.__start_time: float = time.time()
 
     async def __reload(self, module_name: str) -> web.Response:
         """
@@ -234,6 +235,11 @@ class DebouncedHotReloader(FileSystemEventHandler):
             current_mtime: float = os.path.getmtime(file_path)
         except OSError:
             # File might not exist anymore
+            return
+
+        # First event for a file untouched since startup is not an edit (e.g. NTFS last-access while importing), just record it
+        if file_path not in self.__mtimes and current_mtime < self.__start_time:
+            self.__mtimes[file_path] = current_mtime
             return
 
         if current_mtime == self.__mtimes.get(file_path):

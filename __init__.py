@@ -7,26 +7,22 @@ import time
 import atexit
 import hashlib
 import logging
-import requests
 import threading
-import importlib
 import asyncio
-import inspect
 from collections import defaultdict
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from aiohttp import web
 
 import folder_paths
-from nodes import load_custom_node
+import nodes
 from comfy_execution import caching
 
 # ==============================================================================
 # === GLOBALS ===
 # ==============================================================================
 
-RELOADED_CLASS_TYPES: dict = {}  # Stores types of classes that have been reloaded.
+RELOAD_GENERATIONS: dict[str, int] = {}  # Reload count per node class type, mixed into the execution cache keys.
 CUSTOM_NODE_ROOT: list[str] = folder_paths.folder_names_and_paths["custom_nodes"][0]  # Custom Node root directory list.
 
 # Set of modules to exclude from reloading.
@@ -107,21 +103,6 @@ def is_hidden_file(file_path: str) -> bool:
 
     return False
 
-def dfs(item_list: list, searches: set) -> bool:
-    """
-    Performs a depth-first search to find items in a list.
-
-    :param item_list: The list of items to search through.
-    :param searches: The set of search items to look for.
-    :return: True if any search item is found, False otherwise.
-    """
-    for item in item_list:
-        if isinstance(item, (frozenset, tuple)) and dfs(item, searches):
-            return True
-        elif item in searches:
-            return True
-    return False
-
 # ==============================================================================
 # === CLASS DEFINITION ===
 # ==============================================================================
@@ -143,73 +124,50 @@ class DebouncedHotReloader(FileSystemEventHandler):
         self.__lock: threading.Lock = threading.Lock()
         self.__start_time: float = time.time()
 
-    async def __reload(self, module_name: str) -> web.Response:
+    async def __reload(self, module_name: str) -> bool:
         """
-        Reloads all relevant modules and clears caches.
+        Reloads a custom node module and bumps the reload generation of the node classes it replaced.
 
         :param module_name: The name of the module to reload.
-        :return: A web response indicating success or failure.
+        :return: True if the module was reloaded successfully.
         """
         with self.__lock:
-            reload_modules: list[str] = [
-                mod_name for mod_name in sys.modules.keys()
-                if module_name in mod_name and mod_name != module_name
-            ]
-
-            # Unload dependent modules first
-            for reload_mod in reload_modules:
-                del sys.modules[reload_mod]
-
-            # Unload the main module
-            if module_name in sys.modules:
-                del sys.modules[module_name]
-
-            module_dir: str = os.path.join(CUSTOM_NODE_ROOT[0], module_name)
-            if os.path.isfile(module_dir):
-                # Single-file custom node (e.g. trainlatent2rgb.py)
-                module_path_init = module_dir
-            else:
-                # Package-style custom node with __init__.py
-                module_path_init = os.path.join(module_dir, '__init__.py')
-            spec = importlib.util.spec_from_file_location(module_name, module_path_init)
-            module = importlib.util.module_from_spec(spec)
-
-            try:
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
-                # V1 node definition
-                if hasattr(module, 'NODE_CLASS_MAPPINGS') and module.NODE_CLASS_MAPPINGS is not None:
-                    for key in module.NODE_CLASS_MAPPINGS.keys():
-                        RELOADED_CLASS_TYPES[key] = 3
-                # V3 Extension Definition
-                elif hasattr(module, 'comfy_entrypoint'):
-                    entrypoint = getattr(module, 'comfy_entrypoint')
-                    if callable(entrypoint):
-                        if inspect.iscoroutinefunction(entrypoint):
-                            extension = await entrypoint()
-                        else:
-                            extension = entrypoint()
-                        node_list = await extension.get_node_list()
-                        for node_cls in node_list:
-                            schema = node_cls.GET_SCHEMA()
-                            RELOADED_CLASS_TYPES[schema.node_id] = 3
-                else:
-                    logging.warning(f"Module {module_name} has neither NODE_CLASS_MAPPINGS nor comfy_entrypoint; cache invalidation skipped.")
-            except Exception as e:
-                logging.error(f"Failed to reload module {module_name}: {e}")
-                return web.Response(text='FAILED')
-
             module_path: str = os.path.join(CUSTOM_NODE_ROOT[0], module_name)
-            await load_custom_node(module_path)
-            return web.Response(text='OK')
+
+            # Unload the module and its submodules, named the way load_custom_node registers them
+            if os.path.isfile(module_path):
+                sys_module_name: str = os.path.splitext(module_path)[0]
+            else:
+                sys_module_name = module_path.replace(".", "_x_")
+            for mod_name in list(sys.modules.keys()):
+                if mod_name == sys_module_name or mod_name.startswith(sys_module_name + "."):
+                    del sys.modules[mod_name]
+
+            old_classes: dict = dict(nodes.NODE_CLASS_MAPPINGS)
+            if not await nodes.load_custom_node(module_path):
+                return False
+
+            for class_type, node_cls in nodes.NODE_CLASS_MAPPINGS.items():
+                if old_classes.get(class_type) is not node_cls:
+                    RELOAD_GENERATIONS[class_type] = RELOAD_GENERATIONS.get(class_type, 0) + 1
+            return True
 
     def on_modified(self, event):
         """Handles file modification events."""
-        if event.is_directory:
-            return
+        if not event.is_directory:
+            self.__check_file(event.src_path)
 
-        file_path: str = event.src_path
+    def on_moved(self, event):
+        """Handles files saved by writing a temporary file and renaming it over the original."""
+        if not event.is_directory:
+            self.__check_file(event.dest_path)
 
+    def __check_file(self, file_path: str):
+        """
+        Schedules a reload of the module owning the file if its contents changed.
+
+        :param file_path: The path of the changed file.
+        """
         # Filter out temporary files created by editors (VS Code, etc.)
         file_name: str = os.path.basename(file_path)
         if file_name.startswith('.') or file_name.endswith(('.tmp', '.swp', '~')) or file_name.startswith('~'):
@@ -290,13 +248,10 @@ class DebouncedHotReloader(FileSystemEventHandler):
                 return
 
         try:
-            response = asyncio.run(self.__reload(module_name))
-            if response.text == 'OK':
+            if asyncio.run(self.__reload(module_name)):
                 logging.info(f'[ComfyUI-HotReloadHack] Reloaded module {module_name}')
             else:
                 logging.warning(f'[ComfyUI-HotReloadHack] Failed to reload module {module_name}')
-        except requests.RequestException as e:
-            logging.error(f"Error calling reload for module {module_name}: {e}")
         except Exception as e:
             logging.exception(f"[ComfyUI-HotReloadHack] {e}")
 
@@ -329,46 +284,35 @@ class HotReloaderService:
 # ==============================================================================
 
 def monkeypatch():
-    """Apply necessary monkey patches for hot reloading."""
+    """Mix the reload generation of node classes into the execution cache keys."""
 
-    original_set_prompt = caching.BasicCache.set_prompt
+    original_get_immediate_node_signature = caching.CacheKeySetInputSignature.get_immediate_node_signature
 
-    def set_prompt(self, dynprompt, node_ids, is_changed_cache):
-        """
-        Custom set_prompt function to handle cache clearing for hot reloading.
+    async def get_immediate_node_signature(self, dynprompt, node_id, ancestor_order_mapping):
+        """Output cache key. Signatures include all ancestors, so everything downstream of a reloaded node re-executes too."""
+        signature = await original_get_immediate_node_signature(self, dynprompt, node_id, ancestor_order_mapping)
+        if dynprompt.has_node(node_id):
+            generation = RELOAD_GENERATIONS.get(dynprompt.get_node(node_id)["class_type"])
+            if generation is not None:
+                signature.append(("HOTRELOAD", generation))
+        return signature
 
-        :param dynprompt: Dynamic prompt to set.
-        :param node_ids: Node IDs to process.
-        :param is_changed_cache: Boolean flag indicating if cache has changed.
-        """
-        if not hasattr(self, 'cache_key_set'):
-            RELOADED_CLASS_TYPES.clear()
-            return original_set_prompt(self, dynprompt, node_ids, is_changed_cache)
+    original_add_keys = caching.CacheKeySetID.add_keys
 
-        found_keys = []
-        for key, item_list in self.cache_key_set.keys.items():
-            if dfs(item_list, RELOADED_CLASS_TYPES):
-                found_keys.append(key)
+    async def add_keys(self, node_ids):
+        """Node instance cache key, so a reloaded node gets an instance of the new class."""
+        await original_add_keys(self, node_ids)
+        for node_id, key in self.keys.items():
+            generation = RELOAD_GENERATIONS.get(key[1])
+            if generation is not None:
+                self.keys[node_id] = key[:2] + (generation,)
 
-        if len(found_keys):
-            for value_key in list(RELOADED_CLASS_TYPES.keys()):
-                RELOADED_CLASS_TYPES[value_key] -= 1
-                if RELOADED_CLASS_TYPES[value_key] == 0:
-                    del RELOADED_CLASS_TYPES[value_key]
-
-        for key in found_keys:
-            cache_key = self.cache_key_set.get_data_key(key)
-            if cache_key and cache_key in self.cache:
-                del self.cache[cache_key]
-                del self.cache_key_set.keys[key]
-                del self.cache_key_set.subcache_keys[key]
-        return original_set_prompt(self, dynprompt, node_ids, is_changed_cache)
-
-    caching.HierarchicalCache.set_prompt = set_prompt
+    caching.CacheKeySetInputSignature.get_immediate_node_signature = get_immediate_node_signature
+    caching.CacheKeySetID.add_keys = add_keys
 
 def setup():
     """Sets up the hot reload system."""
-    logging.info("[ComfyUI-HotReloadHack] Monkey patching comfy_execution.caching.BasicCache")
+    logging.info("[ComfyUI-HotReloadHack] Patching execution cache keys")
     monkeypatch()
     logging.info("[ComfyUI-HotReloadHack] Starting Hot Reloader")
     hot_reloader_service = HotReloaderService(delay=DEBOUNCE_TIME)
